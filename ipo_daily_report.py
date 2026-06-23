@@ -224,7 +224,7 @@ def fetch_bond_detail(secu_code):
 
         bond = data["result"]["data"][0]
         info["bond_name"] = bond.get("BOND_NAME", "") or bond.get("SECURITY_NAME_ABBR", "")
-        info["rating"] = bond.get("RATING", "")
+        info["rating"] = (bond.get("RATING", "") or "").replace("sti", "").replace("STI", "")
         info["issue_scale"] = bond.get("ACTUAL_ISSUE_SCALE")  # 发行规模(亿)
         info["convert_price"] = bond.get("INITIAL_TRANSFER_PRICE")  # 转股价
         info["bond_price"] = bond.get("CURRENT_BOND_PRICENEW", 100)  # 债券现价
@@ -1258,17 +1258,17 @@ _TEMP_CALIBRATED = False
 def detect_market_temperature():
     """
     检测当前新股市场温度
-    从 ipo_history.db 统计近3个月数据
-    返回 {'level': '热市'|'常温'|'冷市', 'break_rate': float, 'avg_gain_3m': float}
+    从 ipo_history.db 统计近6个月数据
+    返回 {'level': '热市'|'常温'|'冷市', 'break_rate': float, 'avg_gain_6m': float}
     """
     global _MARKET_TEMP, _TEMP_CALIBRATED
     from datetime import datetime, timedelta
 
-    cutoff = (datetime.now() - timedelta(days=90)).strftime("%Y-%m-%d")
+    cutoff = (datetime.now() - timedelta(days=180)).strftime("%Y-%m-%d")
     try:
         conn = _init_ipo_db()
         rows = conn.execute(
-            "SELECT ld_close_change FROM ipo_history WHERE listing_date >= ? AND ld_close_change IS NOT NULL",
+            "SELECT ld_close_change FROM ipo_history WHERE listing_date >= ? AND ld_close_change IS NOT NULL AND market_type != '北交所'",
             (cutoff,),
         ).fetchall()
         conn.close()
@@ -1297,8 +1297,195 @@ def detect_market_temperature():
     _MARKET_TEMP = {"level": level, "break_rate": round(break_rate * 100, 1), "avg_gain_3m": round(avg_gain, 1)}
     _TEMP_CALIBRATED = True
 
-    print(f"[市场温度] {level}（破发率{_MARKET_TEMP['break_rate']}%，3月均涨幅{_MARKET_TEMP['avg_gain_3m']}%）")
+    print(f"[市场温度] {level}（破发率{_MARKET_TEMP['break_rate']}%，6月均涨幅{_MARKET_TEMP['avg_gain_3m']}%）")
     return _MARKET_TEMP
+
+
+# ── 新债市场温度（独立计算） ──
+_BOND_MARKET_TEMP = {"level": "热市", "break_rate": 0, "avg_gain_6m": 0}
+
+def detect_bond_market_temperature():
+    """
+    检测当前新债（可转债）市场温度
+    从 bond_history 表或东财接口统计近6个月数据
+    返回 {'level': '热市'|'常温'|'冷市', 'break_rate': float, 'avg_gain_6m': float}
+    """
+    global _BOND_MARKET_TEMP
+    from datetime import datetime, timedelta
+
+    cutoff = (datetime.now() - timedelta(days=180)).strftime("%Y-%m-%d")
+
+    # 先从数据库查，检查数据是否够新（24h内）
+    try:
+        conn = _init_ipo_db()
+        last_update = conn.execute("SELECT MAX(updated_at) FROM bond_history").fetchone()[0]
+        need_fetch = True
+        if last_update:
+            try:
+                last_dt = datetime.strptime(last_update, "%Y-%m-%d %H:%M:%S")
+                if (datetime.now() - last_dt).total_seconds() < 86400:
+                    need_fetch = False
+            except ValueError:
+                pass
+
+        if need_fetch:
+            conn.close()
+            rows = _fetch_bond_listing_data_from_api(cutoff)
+            # 保存后重新读取
+            conn = _init_ipo_db()
+            db_rows = conn.execute(
+                "SELECT first_day_return FROM bond_history WHERE listing_date >= ? AND first_day_return IS NOT NULL",
+                (cutoff,),
+            ).fetchall()
+            conn.close()
+            rows = [r[0] for r in db_rows]
+        else:
+            db_rows = conn.execute(
+                "SELECT first_day_return FROM bond_history WHERE listing_date >= ? AND first_day_return IS NOT NULL",
+                (cutoff,),
+            ).fetchall()
+            conn.close()
+            rows = [r[0] for r in db_rows]
+    except Exception:
+        rows = []
+
+    if not rows:
+        print("[新债市场温度] 数据不足，默认热市")
+        _BOND_MARKET_TEMP = {"level": "热市", "break_rate": 0, "avg_gain_6m": 30}
+        return _BOND_MARKET_TEMP
+
+    gains = rows
+    total = len(gains)
+    break_count = sum(1 for g in gains if g < 0)
+    break_rate = break_count / total if total > 0 else 0
+    avg_gain = sum(gains) / total if total > 0 else 0
+
+    if break_rate == 0 and avg_gain > 40:
+        level = "热市"
+    elif break_rate < 0.05 and avg_gain > 10:
+        level = "常温"
+    else:
+        level = "冷市"
+
+    _BOND_MARKET_TEMP = {"level": level, "break_rate": round(break_rate * 100, 1), "avg_gain_6m": round(avg_gain, 1)}
+    print(f"[新债市场温度] {level}（破发率{_BOND_MARKET_TEMP['break_rate']}%，6月均涨幅{_BOND_MARKET_TEMP['avg_gain_6m']}%）")
+    return _BOND_MARKET_TEMP
+
+
+def _fetch_bond_listing_data_from_api(cutoff_date):
+    """从东财获取近6个月上市新债，再从腾讯K线获取上市首日收盘价计算涨幅"""
+    import re as _re
+    from datetime import datetime
+
+    s = _get_session()
+    url = "https://datacenter-web.eastmoney.com/api/data/v1/get"
+    bonds = []  # [(code, name, listing_date)]
+    now = datetime.now()
+
+    # 1. 从东财获取最近上市的新债代码
+    for page in range(1, 20):
+        params = {
+            "reportName": "RPT_BOND_CB_LIST",
+            "columns": "SECURITY_CODE,SECURITY_NAME_ABBR,LISTING_DATE",
+            "pageNumber": page,
+            "pageSize": 100,
+            "sortTypes": -1,
+            "sortColumns": "LISTING_DATE",
+            "filter": f"(LISTING_DATE>='{cutoff_date}')",
+            "source": "WEB",
+            "client": "WEB",
+        }
+        try:
+            resp = s.get(url, params=params, timeout=15)
+            data = resp.json()
+            if not (data.get("success") and data["result"] and data["result"]["data"]):
+                break
+            for b in data["result"]["data"]:
+                listing_date_str = b.get("LISTING_DATE", "")
+                if not listing_date_str:
+                    continue
+                try:
+                    ld = listing_date_str[:10]
+                    listing_dt = datetime.strptime(ld, "%Y-%m-%d")
+                except ValueError:
+                    continue
+                if (now - listing_dt).days > 180:
+                    continue
+                code = b.get("SECURITY_CODE", "")
+                name = b.get("SECURITY_NAME_ABBR", "")
+                if code:
+                    bonds.append((code, name, ld))
+        except Exception:
+            break
+
+    if not bonds:
+        return []
+
+    # 2. 从腾讯K线获取上市首日收盘价
+    gains = []
+    for code, name, ld in bonds:
+        prefix = _get_qt_prefix(code)
+        qt_code = f"{prefix}{code}"
+        # 取上市日后第2个交易日收盘价（避开首日涨跌幅限制）
+        kline_url = f"https://web.ifzq.gtimg.cn/appstock/app/fqkline/get?param={qt_code},day,,,365,qfq"
+        try:
+            resp = s.get(kline_url, timeout=10)
+            kdata = resp.json()
+            days = (kdata.get("data", {}).get(qt_code, {}).get("day") or
+                    kdata.get("data", {}).get(qt_code.replace("sh", "sz"), {}).get("day") or
+                    kdata.get("data", {}).get(qt_code.replace("sz", "sh"), {}).get("day") or [])
+            day2_close = None
+            listing_found = False
+            prev_close = None
+            day_num = 0
+            for d in days:
+                if d[0] == ld:
+                    listing_found = True
+                    day_num = 1
+                    prev_close = float(d[2])
+                    # D1涨停→跳过，否则直接取D1
+                    if prev_close < 157.0:
+                        day2_close = prev_close
+                        break
+                    continue
+                if listing_found and len(d) >= 3:
+                    day_num += 1
+                    close = float(d[2])
+                    # 计算当日理论涨停价（可转债日常±20%）
+                    limit_price = round(prev_close * 1.2, 1)
+                    # 没涨停→取这天
+                    if abs(close - limit_price) > 0.5:
+                        day2_close = close
+                        break
+                    # 涨停了→记录暂存，继续看下一天
+                    prev_close = close
+                    day2_close = close
+            if day2_close is None:
+                # 所有天都涨停，fallback到首日收盘
+                for d in days:
+                    if d[0] == ld and len(d) >= 3:
+                        day2_close = float(d[2])
+                        break
+            if day2_close is None:
+                continue
+            first_day_return = day2_close - 100  # 百分比值
+            gains.append(first_day_return)
+            # 保存到数据库
+            try:
+                conn = _init_ipo_db()
+                conn.execute(
+                    "INSERT OR REPLACE INTO bond_history (security_code, security_name, listing_date, first_day_return, updated_at) VALUES (?,?,?,?,?)",
+                    (code, name, ld, round(first_day_return, 2), datetime.now().strftime("%Y-%m-%d %H:%M:%S")),
+                )
+                conn.commit()
+                conn.close()
+            except Exception:
+                pass
+        except Exception:
+            continue
+
+    print(f"[新债温度] 从K线获取到 {len(gains)} 只新债首日涨幅")
+    return gains
 
 
 def get_temp_pe_penalty(issue_pe, industry_pe):
@@ -1420,6 +1607,34 @@ def _init_ipo_db():
             ld_close_change REAL,
             board_key TEXT,
             updated_at TEXT
+        )
+    """)
+    conn.execute("""
+        CREATE TABLE IF NOT EXISTS bond_history (
+            security_code TEXT PRIMARY KEY,
+            security_name TEXT,
+            listing_date TEXT,
+            first_day_return REAL,
+            updated_at TEXT
+        )
+    """)
+    conn.execute("""
+        CREATE TABLE IF NOT EXISTS predictions (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            type TEXT NOT NULL,
+            code TEXT NOT NULL,
+            name TEXT NOT NULL,
+            listing_date TEXT NOT NULL,
+            pred_date TEXT NOT NULL,
+            pred_return REAL,
+            pred_price REAL,
+            pred_advice TEXT,
+            actual_return REAL,
+            actual_price REAL,
+            actual_date TEXT,
+            status TEXT DEFAULT 'pending',
+            updated_at TEXT,
+            UNIQUE(type, code, pred_date)
         )
     """)
     conn.commit()
@@ -1796,6 +2011,212 @@ def detect_stock_hot_sector(stock_name, main_business, industry):
     return best_label, best_boost
 
 
+# ════════════════════════════════════════════
+# XGBoost 动态校准：牛市修正参数
+# ════════════════════════════════════════════
+
+def _get_board_key_from_code(code):
+    """从股票代码获取板块键"""
+    code_str = str(code)
+    if code_str.startswith("688"):
+        return "科创板"
+    if code_str.startswith(("300", "301")):
+        return "创业板"
+    if code_str.startswith(("000", "001", "002", "003")):
+        return "深市主板"
+    if code_str.startswith(("60",)):
+        return "沪市主板"
+    return "科创板"
+
+
+def _calc_xgb_boost(stock_detail, xgb_raw):
+    """根据板块基准和市场温度，计算XGBoost动态调整系数"""
+    if xgb_raw is None or xgb_raw <= 0:
+        return 1.0
+
+    code = stock_detail.get("stock_code", "")
+    board_key = _get_board_key_from_code(code)
+    board_base = BOARD_BASE.get(board_key, 200)
+
+    # 目标：让XGBoost预测值向板块基准收敛
+    # 如果XGBoost明显低于板块基准（在牛市常见），则向上修正
+    ratio = board_base / max(xgb_raw, 10)
+
+    # 热市下，如果板基准远高于XGBoost，加大修正力度
+    temp = _MARKET_TEMP["level"]
+    if temp == "热市":
+        # 热市时板基准置信度高，主动拉高XGBoost
+        boost = 1.0 + (ratio - 1.0) * 0.6
+    elif temp == "常温":
+        boost = 1.0 + (ratio - 1.0) * 0.3
+    else:
+        # 冷市：不向上修正，反而保守
+        boost = 1.0
+
+    # 限制范围 0.5x ~ 3.0x
+    boost = max(0.5, min(3.0, boost))
+    return round(boost, 3)
+
+
+# ════════════════════════════════════════════
+# 预测跟踪 & 准确率统计
+# ════════════════════════════════════════════
+
+def save_predictions(apply_stocks, apply_bonds, list_stocks, list_bonds, pred_date):
+    """保存预测记录到数据库"""
+    import sqlite3
+    today_str = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    conn = _init_ipo_db()
+
+    rows = []
+    for s in apply_stocks + list_stocks:
+        analysis = s.get("listing_analysis", {})
+        pred_return = None
+        if isinstance(analysis, dict):
+            pred_return = analysis.get("predicted_return") or analysis.get("price")
+        advice = s.get("advice", "")
+        listing_date = pred_date
+
+        rows.append(("stock", s["code"], s["name"], listing_date,
+                      pred_date, pred_return, None, advice,
+                      today_str))
+
+    for b in apply_bonds + list_bonds:
+        analysis = b.get("listing_analysis", {})
+        pred_price = None
+        pred_return = None
+        if isinstance(analysis, dict):
+            pred_price = analysis.get("price")
+            pred_return = analysis.get("premium")
+        advice = b.get("advice", "")
+        listing_date = pred_date
+
+        rows.append(("bond", b["code"], b["name"], listing_date,
+                      pred_date, pred_return, pred_price, advice,
+                      today_str))
+
+    for row in rows:
+        try:
+            conn.execute("""
+                INSERT OR REPLACE INTO predictions
+                    (type, code, name, listing_date, pred_date, pred_return, pred_price, pred_advice, updated_at)
+                VALUES (?,?,?,?,?,?,?,?,?)
+            """, row)
+        except Exception:
+            pass
+    conn.commit()
+    conn.close()
+    if rows:
+        print(f"[预测跟踪] 已保存 {len(rows)} 条预测记录")
+
+
+def backfill_prediction_actuals():
+    """回填已上市预测的实际结果"""
+    import sqlite3
+    from datetime import datetime
+
+    conn = _init_ipo_db()
+    today_str = datetime.now().strftime("%Y-%m-%d")
+
+    # 找出已到上市日期的待回填预测
+    pending = conn.execute(
+        "SELECT id, type, code, name, listing_date FROM predictions WHERE status='pending' AND listing_date <= ?",
+        (today_str,),
+    ).fetchall()
+
+    if not pending:
+        conn.close()
+        return
+
+    updated = 0
+    for pid, ptype, code, name, listing_date in pending:
+        try:
+            if ptype == "stock":
+                # 从 ipo_history 取实际首日涨幅
+                row = conn.execute(
+                    "SELECT ld_close_change FROM ipo_history WHERE security_code=? AND listing_date=? AND ld_close_change IS NOT NULL",
+                    (code, listing_date),
+                ).fetchone()
+                if row:
+                    conn.execute(
+                        "UPDATE predictions SET actual_return=?, status='fulfilled', updated_at=? WHERE id=?",
+                        (row[0], datetime.now().strftime("%Y-%m-%d %H:%M:%S"), pid),
+                    )
+                    updated += 1
+            else:
+                # bond: 从 bond_history 取 first_day_return
+                row = conn.execute(
+                    "SELECT first_day_return FROM bond_history WHERE security_code=? AND listing_date=? AND first_day_return IS NOT NULL",
+                    (code, listing_date),
+                ).fetchone()
+                if row:
+                    conn.execute(
+                        "UPDATE predictions SET actual_return=?, status='fulfilled', updated_at=? WHERE id=?",
+                        (row[0], datetime.now().strftime("%Y-%m-%d %H:%M:%S"), pid),
+                    )
+                    updated += 1
+        except Exception:
+            pass
+
+    conn.commit()
+    conn.close()
+    if updated > 0:
+        print(f"[预测跟踪] 已回填 {updated} 条实际结果")
+
+
+def get_prediction_accuracy(days=90):
+    """获取最近N天的预测统计"""
+    import sqlite3
+    from datetime import datetime, timedelta
+
+    conn = _init_ipo_db()
+    cutoff = (datetime.now() - timedelta(days=days)).strftime("%Y-%m-%d")
+
+    results = {"stock": {"total": 0, "fulfilled": 0, "errors": [], "mae": 0},
+               "bond": {"total": 0, "fulfilled": 0, "errors": [], "mae": 0}}
+
+    for ptype in ("stock", "bond"):
+        rows = conn.execute(
+            "SELECT pred_return, actual_return FROM predictions WHERE type=? AND status='fulfilled' AND actual_return IS NOT NULL AND pred_return IS NOT NULL AND pred_date >= ?",
+            (ptype, cutoff),
+        ).fetchall()
+        if rows:
+            results[ptype]["total"] = len(rows)
+            results[ptype]["fulfilled"] = len(rows)
+            errors = [abs(round(p - a, 1)) for p, a in rows]
+            results[ptype]["errors"] = errors
+            results[ptype]["mae"] = round(sum(errors) / len(errors), 1)
+
+    conn.close()
+    return results
+
+
+def _build_accuracy_lines(days=90):
+    """生成准确率统计文本行"""
+    stats = get_prediction_accuracy(days)
+    lines = []
+    lines.append("")
+    lines.append("---")
+    lines.append("")
+    lines.append("## 📊 预测跟踪统计")
+    lines.append("")
+    lines.append(f"> 统计近 {days} 天预测 vs 实际上市结果")
+    lines.append("")
+    has_data = False
+    for label, key in [("新股", "stock"), ("新债", "bond")]:
+        s = stats[key]
+        if s["fulfilled"] > 0:
+            has_data = True
+            lines.append(f"**{label}**：已上市 {s['fulfilled']} 只，平均偏差 {s['mae']}pp")
+        else:
+            lines.append(f"**{label}**：暂无已上市数据")
+    if not has_data:
+        lines.append("> 暂无已上市的预测记录，数据将随交易日积累")
+    lines.append("")
+    lines.append("> ⚡ 系统会根据实际结果持续校准预测模型，提升准确率")
+    return lines
+
+
 def calibrate_board_base():
     """
     自动校准板块基准首日涨幅
@@ -2094,13 +2515,13 @@ def get_valuation_advice(item_type, issue_pe, industry_pe, rating=None, stock_de
     if item_type == "bond":
         # 可转债估值逻辑（不变）
         if rating and rating.startswith("AAA"):
-            return "⭐⭐⭐⭐⭐ 强烈推荐", "优质AAA级转债，破发风险极低"
+            return "顶格申购", "优质AAA级转债，破发风险极低"
         elif rating and rating.startswith("AA"):
-            return "⭐⭐⭐⭐ 推荐申购", "AA级转债，安全性较高"
+            return "顶格申购", "AA级转债，安全性较高"
         elif rating and rating.startswith("A"):
-            return "⭐⭐⭐ 可以申购", "A级转债，注意正股基本面"
+            return "可以申购", "A级转债，注意正股基本面"
         else:
-            return "⭐⭐⭐ 可以申购", "转债打新整体风险可控"
+            return "可以申购", "转债打新整体风险可控"
 
     # ── 新股申购建议（市场温度自适应版） ──
 
@@ -2219,38 +2640,38 @@ def get_valuation_advice(item_type, issue_pe, industry_pe, rating=None, stock_de
 
     if temp != "冷市":
         if score >= 500:
-            advice = "⭐⭐⭐⭐⭐ 强烈推荐"
+            advice = "顶格申购"
             if sector_label:
                 reason = f"热门赛道({sector_label})，预计首日涨幅可观{extra_str}"
             else:
                 reason = f"板块优质，预计首日涨幅较高{extra_str}"
         elif score >= 300:
-            advice = "⭐⭐⭐⭐ 推荐申购"
+            advice = "顶格申购"
             reason = f"预计首日涨幅良好{extra_str}"
             if sector_label:
                 reason += f"，{sector_label}赛道加持"
         elif score >= 150:
-            advice = "⭐⭐⭐⭐ 推荐申购"
+            advice = "顶格申购"
             if sector_label:
                 reason = f"当前市场零破发，中签即赚，{sector_label}赛道加持{extra_str}"
             else:
                 reason = f"当前市场零破发，中签即赚{extra_str}"
         else:
-            advice = "⭐⭐⭐ 可以申购"
+            advice = "可以申购"
             reason = f"当前市场零破发，中签即赚{extra_str}"
     else:
         # 冷市：新增谨慎/不建议等级
         if score >= 400:
-            advice = "⭐⭐⭐⭐ 推荐申购"
+            advice = "顶格申购"
             reason = "冷市中相对优质，注意控制仓位"
         elif score >= 200:
-            advice = "⭐⭐⭐ 可以申购"
+            advice = "可以申购"
             reason = "冷市环境下，建议谨慎参与"
         elif score >= 100:
-            advice = "⚠️ 谨慎申购"
+            advice = "谨慎申购"
             reason = "市场降温，破发风险上升"
         else:
-            advice = "❌ 不建议申购"
+            advice = "放弃申购"
             reason = "冷市+高估值，破发风险较大"
 
     return advice, reason
@@ -2363,10 +2784,20 @@ def _xgb_predict_listing(stock_detail, sector_label="", sector_boost=0):
         estimated = float(_XGB_MODEL.predict(xgb.DMatrix(features))[0])
         estimated = int(round(max(estimated, 0)))
 
-        detail_parts = [
-            f"📊 预估首日涨幅: {estimated}%（🤖 XGBoost模型）",
-            f"📋 发行数据: 价{ip}元 PE{ipe} 中签{lr}% 流通{cmv:.1f}亿",
-        ]
+        # XGBoost动态校准：按板块基准 + 市场温度调整
+        xgb_boost = _calc_xgb_boost(stock_detail, estimated)
+        if xgb_boost != 1.0:
+            old_est = estimated
+            estimated = int(round(estimated * xgb_boost))
+            detail_parts = [
+                f"📊 预估首日涨幅: {estimated}%（🤖 XGBoost模型，校准系数×{xgb_boost}）",
+                f"📋 发行数据: 价{ip}元 PE{ipe} 中签{lr}% 流通{cmv:.1f}亿",
+            ]
+        else:
+            detail_parts = [
+                f"📊 预估首日涨幅: {estimated}%（🤖 XGBoost模型）",
+                f"📋 发行数据: 价{ip}元 PE{ipe} 中签{lr}% 流通{cmv:.1f}亿",
+            ]
 
         return estimated, detail_parts
     except Exception as e:
@@ -2427,7 +2858,7 @@ def get_listing_analysis(item_type, issue_price, issue_pe, industry_pe, bond_det
         else:
             summary = f"预计首日涨幅约{estimated}%（XGBoost）"
 
-        return {"summary": summary, "detail": "\n".join(detail_parts), "price": None}
+        return {"summary": summary, "detail": "\n".join(detail_parts), "price": None, "predicted_return": estimated}
 
     # ── 回退：改进版线性模型 ──
     unified_base = _MARKET_TEMP.get("avg_gain_3m", 250)
@@ -2523,6 +2954,7 @@ def get_listing_analysis(item_type, issue_price, issue_pe, industry_pe, bond_det
         "summary": summary,
         "detail": " | ".join(detail_parts),
         "price": None,
+        "predicted_return": estimated,
     }
 
 
@@ -2580,7 +3012,7 @@ def build_report(target_date):
     print(f"明日申购: 新股{len(target_apply_stocks)}只, 新债{len(target_apply_bonds)}只")
     print(f"明日上市: 新股{len(target_list_stocks)}只, 新债{len(target_list_bonds)}只")
 
-    # 获取新股详情
+    # 获取新股详情（如果没有新股则跳过）
     for stock in target_apply_stocks + target_list_stocks:
         code = stock["secu_code"].split(".")[0]
         detail = fetch_stock_detail(code)
@@ -2595,7 +3027,7 @@ def build_report(target_date):
         else:
             stock["has_detail"] = False
 
-    # 获取新债详情
+    # 获取新债详情（如果没有新债则跳过）
     for bond in target_apply_bonds + target_list_bonds:
         code = bond["secu_code"].split(".")[0]
         detail = fetch_bond_detail(code)
@@ -2605,7 +3037,7 @@ def build_report(target_date):
         else:
             bond["has_detail"] = False
 
-    # 4. 生成估值建议
+    # 4. 生成估值建议（只在有对应类型时计算）
     for stock in target_apply_stocks:
         if stock.get("has_detail"):
             d = stock["detail"]
@@ -2620,7 +3052,7 @@ def build_report(target_date):
                 "bond", None, None, d.get("rating")
             )
         else:
-            bond["advice"], bond["reason"] = "⭐⭐⭐ 可以申购", "可转债打新整体风险较低"
+            bond["advice"], bond["reason"] = "可以申购", "可转债打新整体风险较低"
 
     for stock in target_list_stocks:
         if stock.get("has_detail"):
@@ -2639,6 +3071,10 @@ def build_report(target_date):
                 bond["listing_analysis"] = {"summary": result, "detail": "", "price": None}
         else:
             bond["listing_analysis"] = {"summary": "预计首日涨幅 15%-30%", "detail": "数据不足", "price": None}
+
+    # 保存预测记录（用于后续跟踪准确率）
+    save_predictions(target_apply_stocks, target_apply_bonds,
+                     target_list_stocks, target_list_bonds, date_str)
 
     # 5. 生成Markdown报告
     return generate_markdown(
@@ -2663,9 +3099,63 @@ def generate_markdown(date_display, weekday, apply_stocks, apply_bonds, list_sto
     lines.append(f"> 📅 报告生成时间：{datetime.now().strftime('%Y-%m-%d %H:%M')}")
     temp = _MARKET_TEMP
     temp_icon = {"热市": "🔥", "常温": "🌤️", "冷市": "❄️"}.get(temp["level"], "🌡️")
-    lines.append(f"> 🌡️ 市场温度：**{temp_icon} {temp['level']}**（破发率{temp['break_rate']}%，近3月均涨幅{temp['avg_gain_3m']}%）")
+    bond_temp = _BOND_MARKET_TEMP
+    btemp_icon = {"热市": "🔥", "常温": "🌤️", "冷市": "❄️"}.get(bond_temp["level"], "🌡️")
+    lines.append(f"> 🌡️ 新股温度：**{temp_icon} {temp['level']}**（破发率{temp['break_rate']}%，近6月均涨幅{temp['avg_gain_3m']}%）")
+    lines.append(f"> 🏷️ 新债温度：**{btemp_icon} {bond_temp['level']}**（破发率{bond_temp['break_rate']}%，近6月均涨幅{bond_temp['avg_gain_6m']}%）")
     lines.append(f"> ⚠️ 声明：以下内容仅供参考，不构成投资建议。打新有风险，投资需谨慎。")
     lines.append("")
+
+    # ── 结论概要 ──
+    lines.append("## 📋 结论")
+    lines.append("")
+
+    def _get_market(code):
+        code_str = str(code)
+        if code_str.startswith("688"):
+            return "科创板"
+        if code_str.startswith("30"):
+            return "创业板"
+        if code_str.startswith(("60", "11", "118")):
+            return "沪市"
+        if code_str.startswith(("00", "12", "123")):
+            return "深市"
+        return ""
+
+    # 上市结论
+    listing_items = []
+    for s in list_stocks:
+        analysis = s.get("listing_analysis", {})
+        summary = analysis.get("summary", "预计上市") if isinstance(analysis, dict) else str(analysis)
+        market = _get_market(s["code"])
+        listing_items.append(f"{s['name']}-{market}（{summary}）")
+    for b in list_bonds:
+        analysis = b.get("listing_analysis", {})
+        summary = analysis.get("summary", "预计上市") if isinstance(analysis, dict) else str(analysis)
+        listing_items.append(f"{b['name']}-{market}（{summary}）")
+    if listing_items:
+        lines.append("**上市**")
+        for item in listing_items:
+            lines.append(f"- {item}")
+        lines.append("")
+
+    # 打新结论
+    apply_items = []
+    for s in apply_stocks:
+        advice = s.get("advice", "可以申购")
+        market = _get_market(s["code"])
+        apply_items.append(f"{s['name']}-{market}（{advice}）")
+    for b in apply_bonds:
+        advice = b.get("advice", "可以申购")
+        rating = ""
+        if b.get("has_detail") and b["detail"].get("rating"):
+            rating = b["detail"]["rating"].replace(" ", "")
+        apply_items.append(f"{b['name']}（{advice}）")
+    if apply_items:
+        lines.append("**打新**")
+        for item in apply_items:
+            lines.append(f"- {item}")
+        lines.append("")
 
     # ========== 一、明日可申购 ==========
     lines.append("---")
@@ -2882,6 +3372,9 @@ def generate_markdown(date_display, weekday, apply_stocks, apply_bonds, list_sto
                             lines.append(f"- **{label}**：约{d['circulation_scale']}亿元")
                         lines.append("")
 
+    # ── 预测跟踪统计 ──
+    lines.extend(_build_accuracy_lines(days=90))
+
     lines.append("---")
     lines.append("")
     lines.append("*本报告由打新日报系统自动生成，数据来源：东方财富网、巨潮资讯网。*")
@@ -2896,6 +3389,8 @@ def generate_html(md_content, data):
     """生成HTML格式日报"""
     temp = _MARKET_TEMP
     temp_icon = {"热市": "🔥", "常温": "🌤️", "冷市": "❄️"}.get(temp["level"], "🌡️")
+    bond_temp = _BOND_MARKET_TEMP
+    btemp_icon = {"热市": "🔥", "常温": "🌤️", "冷市": "❄️"}.get(bond_temp["level"], "🌡️")
     # 简单的HTML模板
     html = f"""<!DOCTYPE html>
 <html lang="zh-CN">
@@ -2927,7 +3422,8 @@ def generate_html(md_content, data):
 <div class="card">
     <h1>🏦 打新日报 — {data['date_display']} {data['weekday']}</h1>
     <p class="subtitle">📅 报告生成时间：{datetime.now().strftime('%Y-%m-%d %H:%M')}</p>
-    <p class="subtitle">🌡️ 市场温度：<strong>{temp_icon} {temp['level']}</strong>（破发率{temp['break_rate']}%，近3月均涨幅{temp['avg_gain_3m']}%）</p>
+    <p class="subtitle">🌡️ 新股温度：<strong>{temp_icon} {temp['level']}</strong>（破发率{temp['break_rate']}%，近6月均涨幅{temp['avg_gain_3m']}%）</p>
+    <p class="subtitle">🏷️ 新债温度：<strong>{btemp_icon} {bond_temp['level']}</strong>（破发率{bond_temp['break_rate']}%，近6月均涨幅{bond_temp['avg_gain_6m']}%）</p>
     <p class="disclaimer">⚠️ 声明：以下内容仅供参考，不构成投资建议。打新有风险，投资需谨慎。</p>
 </div>
 """
@@ -3073,12 +3569,16 @@ def generate_html(md_content, data):
 
 def main():
     """主函数 - 支持命令行传参指定日期"""
+    # 预测跟踪：回填已上市的实际结果
+    backfill_prediction_actuals()
     # 自动校准板块基准
     calibrate_board_base()
     # 自动校准赛道热度系数
     calibrate_sector_boost()
     # 检测市场温度
     detect_market_temperature()
+    detect_bond_market_temperature()
+
 
     import sys
     if len(sys.argv) > 1:

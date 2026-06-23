@@ -9,3 +9,7 @@ nul
 *.pkl
 *.tgz
 package/
+.git_token
+*.png
+*.txt
+askpass.bat
