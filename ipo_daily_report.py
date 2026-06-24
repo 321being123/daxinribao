@@ -15,7 +15,7 @@ import time
 from datetime import datetime, timedelta
 
 # ============ 配置 ============
-OUTPUT_DIR = r"D:\Users\日报"
+OUTPUT_DIR = r"D:\Users\日报\日报"
 CALENDAR_API = "https://datacenter-web.eastmoney.com/api/data/v1/get"
 DETAIL_API = "https://ds.emoney.cn/DataCenter2/datacenter/NewStockXgzl"
 BOND_DETAIL_URL = "https://data.eastmoney.com/kzz/detail/{code}.html"
@@ -1645,18 +1645,29 @@ def _sync_ipo_history(records):
     """
     将接口返回的新股数据同步到本地数据库
     已存在的记录跳过（不变），新增的记录插入
+    已存在但LD_CLOSE_CHANGE为空的记录，若接口提供则更新
     """
     import sqlite3
     conn = _init_ipo_db()
     inserted = 0
+    updated = 0
     now_str = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
     for r in records:
         code = r.get("SECURITY_CODE", "")
         if not code:
             continue
+        api_close_change = r.get("LD_CLOSE_CHANGE")
         # 检查是否已存在
-        cur = conn.execute("SELECT 1 FROM ipo_history WHERE security_code=?", (code,))
-        if cur.fetchone():
+        cur = conn.execute("SELECT ld_close_change FROM ipo_history WHERE security_code=?", (code,))
+        existing = cur.fetchone()
+        if existing:
+            # 已存在且ld_close_change为空，但接口现在提供 → 更新
+            if existing[0] is None and api_close_change is not None:
+                conn.execute(
+                    "UPDATE ipo_history SET ld_close_change=?, updated_at=? WHERE security_code=?",
+                    (api_close_change, now_str, code),
+                )
+                updated += 1
             continue
         mt = r.get("MARKET_TYPE", "")
         board_key = _market_type_to_board_key(mt, code)
@@ -1667,7 +1678,7 @@ def _sync_ipo_history(records):
                 r.get("SECURITY_NAME_ABBR", ""),
                 mt,
                 r.get("LISTING_DATE", ""),
-                r.get("LD_CLOSE_CHANGE"),
+                api_close_change,
                 board_key,
                 now_str,
             ),
@@ -1675,6 +1686,8 @@ def _sync_ipo_history(records):
         inserted += 1
     conn.commit()
     conn.close()
+    if updated > 0:
+        print(f"[校准] 回填 {updated} 条LD_CLOSE_CHANGE")
     return inserted
 
 
@@ -2056,6 +2069,107 @@ def _calc_xgb_boost(stock_detail, xgb_raw):
     # 限制范围 0.5x ~ 3.0x
     boost = max(0.5, min(3.0, boost))
     return round(boost, 3)
+
+
+# ════════════════════════════════════════════
+# 上市后回填 & 预测误差校准
+# ════════════════════════════════════════════
+
+def _fetch_stock_listing_actuals():
+    """
+    从腾讯K线获取已上市股票的实际首日涨跌幅，更新ipo_history
+    用于补全上市前接口未返回的LD_CLOSE_CHANGE
+    """
+    import sqlite3
+    from datetime import datetime, timedelta
+
+    today_str = datetime.now().strftime("%Y-%m-%d")
+    conn = _init_ipo_db()
+
+    # 找出已到上市日但ld_close_change仍为空的股票（近30天）
+    cutoff = (datetime.now() - timedelta(days=30)).strftime("%Y-%m-%d")
+    candidates = conn.execute(
+        "SELECT security_code, security_name, listing_date, issue_price FROM ipo_history "
+        "WHERE listing_date >= ? AND listing_date <= ? AND ld_close_change IS NULL AND issue_price IS NOT NULL",
+        (cutoff, today_str),
+    ).fetchall()
+
+    if not candidates:
+        conn.close()
+        return
+
+    s = _get_session()
+    updated = 0
+    for code, name, listing_date, issue_price in candidates:
+        try:
+            ld = listing_date[:10]
+            prefix = _get_qt_prefix(code)
+            qt_code = f"{prefix}{code}"
+            kline_url = f"https://web.ifzq.gtimg.cn/appstock/app/fqkline/get?param={qt_code},day,,,365,qfq"
+            resp = s.get(kline_url, timeout=10)
+            kdata = resp.json()
+            days = (kdata.get("data", {}).get(qt_code, {}).get("day") or
+                    kdata.get("data", {}).get(qt_code.replace("sh", "sz"), {}).get("day") or
+                    kdata.get("data", {}).get(qt_code.replace("sz", "sh"), {}).get("day") or [])
+
+            # 找到上市日收盘价
+            first_day_close = None
+            for d in days:
+                if d[0] == ld and len(d) >= 3:
+                    first_day_close = float(d[2])
+                    break
+
+            if first_day_close is None or issue_price <= 0:
+                continue
+
+            ld_close_change = round((first_day_close - issue_price) / issue_price * 100, 2)
+            conn.execute(
+                "UPDATE ipo_history SET ld_close_change=?, updated_at=? WHERE security_code=?",
+                (ld_close_change, datetime.now().strftime("%Y-%m-%d %H:%M:%S"), code),
+            )
+            updated += 1
+            print(f"  [回填] {code} {name} 首日涨幅{ld_close_change}%（发行价{issue_price}→收盘{first_day_close}）")
+        except Exception as e:
+            continue
+
+    conn.commit()
+    conn.close()
+    if updated > 0:
+        print(f"[回填] 从K线回填 {updated} 只股票的首日涨幅")
+
+
+def _log_prediction_errors():
+    """
+    统计预测 vs 实际误差，输出到日志供参考
+    后续可用此数据自动校准预测参数
+    """
+    import sqlite3
+    from datetime import datetime, timedelta
+
+    conn = _init_ipo_db()
+    cutoff = (datetime.now() - timedelta(days=90)).strftime("%Y-%m-%d")
+
+    for ptype, label in [("stock", "新股"), ("bond", "新债")]:
+        rows = conn.execute(
+            "SELECT name, code, pred_return, actual_return, listing_date FROM predictions "
+            "WHERE type=? AND status='fulfilled' AND actual_return IS NOT NULL AND pred_return IS NOT NULL "
+            "AND pred_date >= ? ORDER BY listing_date DESC LIMIT 10",
+            (ptype, cutoff),
+        ).fetchall()
+        if rows:
+            errors = [abs(r[2] - r[3]) for r in rows if r[3] is not None]
+            if errors:
+                mae = round(sum(errors) / len(errors), 1)
+                bias = round(sum(r[3] - r[2] for r in rows if r[3] is not None) / len(errors), 1)
+                print(f"[校准] {label}预测偏差: MAE={mae}pp, 平均偏向={bias}pp（正=低估, 负=高估）")
+                # 偏差过大时输出明细
+                if abs(bias) > 100:
+                    print(f"[校准] {label}偏差较大，明细如下：")
+                    for r in rows:
+                        if r[3] is not None:
+                            print(f"  {r[0]}({r[1]}): 预测{r[2]}% 实际{r[3]}% 误差{r[3]-r[2]:+.1f}pp")
+
+    conn.close()
 
 
 # ════════════════════════════════════════════
@@ -3569,8 +3683,12 @@ def generate_html(md_content, data):
 
 def main():
     """主函数 - 支持命令行传参指定日期"""
+    # 上市后回填：从K线补全实际首日涨跌幅
+    _fetch_stock_listing_actuals()
     # 预测跟踪：回填已上市的实际结果
     backfill_prediction_actuals()
+    # 预测误差日志
+    _log_prediction_errors()
     # 自动校准板块基准
     calibrate_board_base()
     # 自动校准赛道热度系数
