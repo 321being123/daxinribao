@@ -322,17 +322,24 @@ _org_id_cache = {}
 
 
 def _get_org_id(stock_code):
-    """从巨潮获取股票orgId（带重试）"""
+    """从巨潮获取股票orgId（带重试，使用独立session避免cookie冲突）"""
+    import time
     if stock_code in _org_id_cache:
         return _org_id_cache[stock_code]
-    import time
     for attempt in range(3):
         try:
             url = "http://www.cninfo.com.cn/new/information/topSearch/query"
-            resp = _get_session().post(url, data={"keyWord": stock_code, "maxNum": 10},
-                                 headers={"User-Agent": HEADERS["User-Agent"],
-                                          "Accept": "application/json"},
+            # 使用独立session，避免共享的Eastmoney cookies干扰cninfo
+            cn_session = requests.Session()
+            cn_session.headers.update({
+                "User-Agent": HEADERS["User-Agent"],
+                "Accept": "application/json",
+                "X-Requested-With": "XMLHttpRequest",
+                "Referer": "http://www.cninfo.com.cn/",
+            })
+            resp = cn_session.post(url, data={"keyWord": stock_code, "maxNum": 10},
                                  timeout=20)
+            cn_session.close()
             for item in resp.json():
                 if item.get("code") == stock_code:
                     _org_id_cache[stock_code] = item["orgId"]
@@ -340,218 +347,325 @@ def _get_org_id(stock_code):
             break
         except Exception as e:
             if attempt < 2:
-                time.sleep(2)
+                time.sleep(3)
             else:
                 print(f"获取orgId失败({stock_code}): {e}")
     _org_id_cache[stock_code] = None
     return None
 
 
+def _parse_bond_top10_holders(text):
+    """
+    解析上市公告书中的"前十名可转换公司债券持有人"表格。
+
+    返回 [(持有人名称, 持有量(张), 持有比例(%)), ...] 或 None
+    """
+    # 找表格起始
+    idx = -1
+    for kw in ['前十名可转换公司债券持有人', '前十名可转换', '前10 名债券持有人']:
+        idx = text.find(kw)
+        if idx >= 0:
+            break
+    if idx < 0:
+        return None
+
+    section = text[idx:]
+
+    # 找表格结束位置：下一个章节头如 "\nX、"
+    end_pos = len(section)
+    for m in re.finditer(r'\n\d+、', section):
+        pos = m.start()
+        if pos > 0:
+            end_pos = pos
+            break
+    for stop in ['发行费用', '二、本次承销', '二、发行费用', '三、本次发行']:
+        pos = section.find(stop)
+        if pos > 0:
+            end_pos = min(end_pos, pos)
+    section = section[:end_pos]
+
+    entries = []
+    lines = section.split('\n')
+    i = 0
+    while i < len(lines):
+        line = lines[i].strip()
+        if re.match(r'^\d+$', line) and 1 <= int(line) <= 50:
+            i += 1
+            while i < len(lines) and not lines[i].strip():
+                i += 1
+            if i >= len(lines):
+                break
+            name_parts = []
+            while i < len(lines):
+                l = lines[i].strip()
+                if not l:
+                    i += 1
+                    continue
+                if re.match(r'^\d+$', l) and 1 <= int(l) <= 50:
+                    break
+                if re.match(r'^[\d,]+\.?\d*$', l):
+                    amount = int(l.replace(',', '').split('.')[0])
+                    i += 1
+                    while i < len(lines) and not lines[i].strip():
+                        i += 1
+                    pct = None
+                    if i < len(lines):
+                        try:
+                            pct = float(lines[i].strip().replace('%', ''))
+                        except:
+                            pass
+                        i += 1
+                    name = ''.join(name_parts).strip()
+                    entries.append((name, amount, pct))
+                    break
+                else:
+                    name_parts.append(l)
+                    i += 1
+        else:
+            i += 1
+
+    return entries if entries else None
+
+
+def _extract_controller_names(text):
+    """
+    从上市公告书中识别控股股东、实际控制人及其控制的企业名称。
+
+    返回 (controller_set, controlled_entity_set)
+    """
+    controllers = set()
+    controlled_entities = set()
+
+    # 控股股东名称
+    for m in re.finditer(r'控股股东[是为:：]\s*(.{2,50})[，。,\n]', text):
+        name = m.group(1).strip()
+        if name:
+            controllers.add(name)
+
+    # 实际控制人名称（可能多个人：XXX先生和YYY女士）
+    for m in re.finditer(r'实际控制人[是为:：\s]*\n?\s*(.{2,80})[。，,\n]', text, re.DOTALL):
+        ctrl_text = m.group(1).strip()
+        parts = re.split(r'[、和与]', ctrl_text)
+        for part in parts:
+            part = re.sub(r'[先生女士]', '', part).strip()
+            if part and len(part) >= 2:
+                controllers.add(part)
+
+    # 实际控制人控制的企业（100%出资额、控制出资额等）
+    for m in re.finditer(r'持有(.{2,30})100%的出资额', text):
+        entity = m.group(1).strip()
+        if entity:
+            controlled_entities.add(entity)
+
+    # 企业名称中出现的"有限公司"或"咨询"等关键词的实体
+    # 从"实际控制人为XXX"段落后上下文找企业名
+    for m in re.finditer(r'(.{2,30})(有限|咨询|投资|合伙)', text):
+        entity = m.group(1).strip() + m.group(2).strip()
+        if entity and len(entity) >= 4:
+            controlled_entities.add(entity)
+
+    return controllers, controlled_entities
+
+
+def _get_cninfo_session():
+    """创建独立的cninfo session，避免共享Eastmoney cookies"""
+    s = requests.Session()
+    s.headers.update({
+        "User-Agent": HEADERS["User-Agent"],
+        "Accept": "application/json",
+        "X-Requested-With": "XMLHttpRequest",
+        "Referer": "http://www.cninfo.com.cn/",
+    })
+    return s
+
+
 def fetch_placing_result(stock_code, issue_scale):
     """
-    从巨潮资讯网获取可转债配售结果公告，提取精确限售数据。
+    从巨潮资讯网获取可转债**上市公告书**，提取精确限售数据。
 
-    算法：限售 = 控股股东 + 实控人 + 一致行动人配售数量（上市后6个月限售）
+    算法：限售 = 控股股东 + 实控人（含其控制企业）+ 一致行动人配售量
           流通 = 发行总量 - 限售
 
-    返回 dict: {"lock_scale": 限售规模(亿), "circulation_scale": 流通规模(亿),
+    返回 dict: {"status": "ok"/"error",
+                "lock_scale": 限售规模(亿), "circulation_scale": 流通规模(亿),
                 "ctrl_zhang": 控股股东配售(张), "total_zhang": 发行总量(张),
-                "ctrl_ratio": 限售占比, "source": "配售结果公告"} 或 None
+                "ctrl_ratio": 限售占比, "source": "上市公告书(明细)",
+                "error": "失败原因(仅error时)"}
     """
     org_id = _get_org_id(stock_code)
     if not org_id:
-        return None
+        return {"status": "error", "error": f"巨潮资讯网无法获取股票{stock_code}的orgId"}
 
     try:
-        # 搜索配售结果公告（时间范围：最近90天）
+        # 搜索公告（时间范围：最近180天）
         url = "http://www.cninfo.com.cn/new/hisAnnouncement/query"
         today = datetime.now()
         end_date = today.strftime("%Y-%m-%d")
-        start_date = (today - timedelta(days=90)).strftime("%Y-%m-%d")
+        start_date = (today - timedelta(days=180)).strftime("%Y-%m-%d")
+        plate = "sz" if len(stock_code) >= 3 and stock_code[0] in ('0', '3') else "sh"
         data = {
-            "pageNum": 1, "pageSize": 30,
+            "pageNum": 1, "pageSize": 50,
             "stock": f"{stock_code},{org_id}",
             "tabName": "fulltext", "column": "szse",
-            "plate": "sz" if int(stock_code) < 600000 else "sh",
+            "plate": plate,
             "seDate": f"{start_date}~{end_date}",
         }
 
         # 带重试的公告查询
         announcements = None
+        cn_session = _get_cninfo_session()
         for attempt in range(3):
             try:
-                resp = _get_session().post(url, data=data, headers={
-                    "User-Agent": HEADERS["User-Agent"],
-                    "X-Requested-With": "XMLHttpRequest",
-                    "Accept": "application/json",
-                }, timeout=20)
+                resp = cn_session.post(url, data=data, timeout=20)
                 result = resp.json()
                 announcements = result.get("announcements") or []
                 break
             except Exception as e:
                 if attempt == 2:
-                    print(f"公告查询失败({stock_code}): {e}")
-                    return None
+                    cn_session.close()
+                    return {"status": "error", "error": f"公告查询接口异常: {e}"}
                 import time
                 time.sleep(2)
 
-        # 找配售结果公告
+        # 优先找上市公告书，没有则尝试发行结果公告
         target = None
+        source_type = ""
         for ann in announcements:
             title = ann.get("announcementTitle", "")
-            if ("中签" in title and "配售" in title) or "发行结果" in title:
+            if "上市公告书" in title and "可转换" in title:
                 target = ann
+                source_type = "上市公告书"
                 break
+        if not target:
+            for ann in announcements:
+                title = ann.get("announcementTitle", "")
+                if ("中签" in title and "配售" in title) or "发行结果" in title:
+                    target = ann
+                    source_type = "发行结果公告"
+                    break
 
         if not target:
-            return None
+            cn_session.close()
+            return {"status": "error", "error": "未找到上市公告书或发行结果公告，可能公告尚未发布或时间超出180天查询范围"}
 
         # 下载PDF
-        adjunct_url = target["adjunctUrl"]
-        pdf_url = f"http://static.cninfo.com.cn/{adjunct_url}"
-        resp_pdf = _get_session().get(pdf_url, timeout=30)
+        pdf_url = f"http://static.cninfo.com.cn/{target['adjunctUrl']}"
+        resp_pdf = cn_session.get(pdf_url, timeout=30)
+        cn_session.close()
         if resp_pdf.status_code != 200:
-            return None
-
-        # 保存到临时文件
-        pdf_path = os.path.join(OUTPUT_DIR, f"_bond_placing_{stock_code}.pdf")
-        with open(pdf_path, "wb") as f:
-            f.write(resp_pdf.content)
+            return {"status": "error", "error": f"PDF下载失败(HTTP {resp_pdf.status_code})"}
 
         # 解析PDF文本
-        doc = fitz.open(pdf_path)
+        doc = fitz.open(stream=resp_pdf.content, filetype='pdf')
         text = ""
         for page in doc:
             text += page.get_text()
         doc.close()
 
-        # 清理临时文件
-        try:
-            os.remove(pdf_path)
-        except Exception:
-            pass
+        if source_type == "上市公告书":
+            # ---- 从上市公告书解析精确限售数据 ----
+            holders = _parse_bond_top10_holders(text)
+            if not holders:
+                return {"status": "error", "error": "上市公告书中未能解析前十名可转换公司债券持有人表格（PDF表格格式可能不被支持）"}
 
-        # 提取关键数据
-        # 1. 发行总量 - 从"原股东"行后的数字匹配
-        total_zhang = None
-        m = re.search(r"发行数量共计\s*([\d,]+)\s*张", text)
-        if m:
-            total_zhang = int(m.group(1).replace(",", ""))
+            controller_names, controlled_entities = _extract_controller_names(text)
 
-        # 2. 控股股东+实控人+一致行动人配售合计
-        # 匹配表格中 "控股股东、实际控制人及其一致行动人" 行后的配售数字
-        ctrl_zhang = None
-        # 方法A: "注1"中明确写出合计获配数量（可能跨行）
-        m = re.search(r"合计获配数量\s*为\s*([\d,]+)\s*张", text)
-        if m:
-            ctrl_zhang = int(m.group(1).replace(",", ""))
-        else:
-            # 方法B: 从表格中提取 "控股股东" 相关行后面的数字
-            # 表格格式: "...控股股东、实\n际控制人及其一致行\n动人\n2,955,827\n2,955,827\n100%"
-            m = re.search(r"控股股东.*?一致行.*?动人?\s*\n\s*([\d,]+)\s*\n\s*([\d,]+)\s*\n\s*100%", text, re.DOTALL)
-            if m:
-                ctrl_zhang = int(m.group(2).replace(",", ""))
+            if not controller_names and not controlled_entities:
+                return {"status": "error", "error": f"上市公告书中未能识别控股股东/实际控制人信息；前十名持有人明细：{'、'.join(f'{n}({a:,}张)' for n,a,_ in holders[:5])}"}
 
-        # 3. 原股东配售总量
-        ps_zhang = None
-        m = re.search(r"优先配售的.*?为\s*[\d,]+\s*元\s*\(\s*([\d,]+)\s*张\s*\)", text)
-        if m:
-            ps_zhang = int(m.group(1).replace(",", ""))
+            # 匹配：控股股东/实控人/控制企业 vs 前十名持有人
+            locked_holders = []
+            for name, amount, pct in holders:
+                is_locked = False
+                # 检查是否为控股股东
+                for ctrl in controller_names:
+                    # 子串匹配（如"南京迪威尔实业有限公司" vs "南京迪威尔实业有限公司"）
+                    if ctrl in name or name in ctrl:
+                        is_locked = True
+                        break
+                if not is_locked:
+                    for entity in controlled_entities:
+                        if entity in name or name in entity:
+                            is_locked = True
+                            break
+                if is_locked:
+                    locked_holders.append((name, amount, pct))
 
-        # 4. 网上发行量
-        web_zhang = None
-        m = re.search(r"网上向社会公众投资者发行的.*?总计为\s*([\d,]+)\s*张", text)
-        if m:
-            web_zhang = int(m.group(1).replace(",", ""))
+            if not locked_holders:
+                holder_summary = '、'.join(f'{n}' for n, a, _ in holders[:5])
+                return {"status": "error", "error": f"控股股东/实控人{controller_names}未在前十名持有人（{holder_summary}…）中找到匹配项"}
 
-        # 计算流通规模
-        if not total_zhang:
-            total_zhang = (ctrl_zhang or 0) + (web_zhang or 0)
-            if total_zhang == 0:
-                return None
+            # 计算
+            ctrl_zhang = sum(a for _, a, _ in locked_holders)
+            # 发行总张数：从issuse_scale推算（亿→元→张）
+            total_zhang = int(issue_scale * 100000000 / 100)
 
-        if ctrl_zhang and ctrl_zhang > 0:
-            # 面值100元/张，亿 = 张数 × 100 / 1亿
             lock_scale = round(ctrl_zhang * 100 / 100000000, 4)
             circulation_scale = round((total_zhang - ctrl_zhang) * 100 / 100000000, 4)
-            ctrl_ratio = round(ctrl_zhang / total_zhang * 100, 2)
+            ctrl_ratio = round(ctrl_zhang / total_zhang * 100, 2) if total_zhang > 0 else 0
+
+            holder_details = '、'.join(f'{n}({a:,}张)' for n, a, _ in locked_holders)
+
             return {
+                "status": "ok",
                 "lock_scale": lock_scale,
                 "circulation_scale": circulation_scale,
                 "ctrl_zhang": ctrl_zhang,
                 "total_zhang": total_zhang,
                 "ctrl_ratio": ctrl_ratio,
-                "source": "配售结果公告",
-                "ps_zhang": ps_zhang,
-                "web_zhang": web_zhang,
+                "source": f"上市公告书（{holder_details}）",
+                "error": None,
             }
 
-    except Exception as e:
-        print(f"获取配售结果失败({stock_code}): {e}")
+        else:
+            # ---- 发行结果公告：只有原股东配售总量，没有控股股东级别的细分解 ----
+            total_zhang = int(issue_scale * 100000000 / 100)
+            ps_zhang = None
+            m = re.search(r"原股东.{0,20}[配售].*?(\d[\d,]*)\s*手", text)
+            if m:
+                ps_zhang = int(m.group(1).replace(",", ""))
 
-    return None
+            web_zhang = None
+            m = re.search(r"网上社会公众投资者.{0,20}认购.*?(\d[\d,]*)\s*手", text)
+            if m:
+                web_zhang = int(m.group(1).replace(",", ""))
+
+            return {"status": "error", "error": f"仅找到发行结果公告，该公告仅有原股东配售总量(ps_zhang={ps_zhang}手)，无法区分控股股东/实控人的具体配售量，需等待上市公告书发布"}
+
+    except Exception as e:
+        return {"status": "error", "error": f"处理异常: {type(e).__name__}: {str(e)}"}
 
 
 def calc_circulation_scale(info):
     """
-    计算可转债流通规模，优先使用配售结果公告精确数据，fallback到估算。
+    从上市公告书获取可转债精确流通规模。
 
-    精确方法：从巨潮配售结果公告PDF提取"控股股东+实控人+一致行动人"配售量
-    估算方法：网上占比分段系数
+    精确方法：从巨潮资讯网下载上市公告书PDF，
+    解析"前十名可转换公司债券持有人"表格，
+    提取控股股东+实控人+一致行动人的配售量为限售依据。
+
+    若获取失败，不返回估算值，而是记录明确失败原因。
     """
     scale = float(info.get("issue_scale", 0))
     if scale <= 0:
         return
 
     stock_code = info.get("stock_code", "")
-    circulation_scale = None
-    lock_scale = None
-    circulation_range = None
-    source_note = ""
+    if not stock_code:
+        info["_note"] = "缺少正股代码，无法查询上市公告书"
+        return
 
-    # 优先：从配售结果公告获取精确数据
-    if stock_code:
-        placing = fetch_placing_result(stock_code, scale)
-        if placing:
-            lock_scale = placing["lock_scale"]
-            circulation_scale = placing["circulation_scale"]
-            source_note = f"配售结果公告（控股+实控人限售{placing['ctrl_ratio']}%）"
-            info["lock_scale"] = lock_scale
-            info["circulation_scale"] = circulation_scale
-            info["_note"] = source_note
-            return
-
-    # Fallback：估算
-    online_lwr = info.get("online_lwr")
-    if online_lwr is not None:
-        online_lwr = float(online_lwr)
+    placing = fetch_placing_result(stock_code, scale)
+    if placing and placing.get("status") == "ok":
+        info["lock_scale"] = placing["lock_scale"]
+        info["circulation_scale"] = placing["circulation_scale"]
+        info["_note"] = placing["source"]
+        info["_circulation_source"] = "上市公告书"
     else:
-        online_lwr = 0.15
-
-    placing_ratio = 1 - online_lwr
-    if online_lwr < 0.10:
-        lock_coef = 0.85
-    elif online_lwr < 0.20:
-        lock_coef = 0.80
-    elif online_lwr < 0.30:
-        lock_coef = 0.75
-    else:
-        lock_coef = 0.70
-
-    lock_ratio = placing_ratio * lock_coef
-    lock_scale = round(scale * lock_ratio, 2)
-    circulation_scale = round(scale * (1 - lock_ratio), 2)
-    circulation_low = round(scale * (1 - placing_ratio * min(lock_coef + 0.10, 0.95)), 2)
-    circulation_high = round(scale * (1 - placing_ratio * max(lock_coef - 0.10, 0.60)), 2)
-    circulation_range = f"{circulation_low}~{circulation_high}亿"
-
-    info["lock_scale"] = lock_scale
-    info["circulation_scale"] = circulation_scale
-    info["circulation_range"] = circulation_range
-    info["_note"] = ("估算值（配售结果公告未发布），以公告为准。"
-                     "估算方法：限售规模=发行规模×原股东配售比例×限售系数，"
-                     "限售系数根据网上发行占比分段取值（<10%→0.85, 10~20%→0.80, 20~30%→0.75, >30%→0.70），"
-                     "该系数基于历史案例回归得出，实际限售比例取决于大股东持股集中度，存在偏差")
+        error_msg = placing.get("error", "查询失败（未知错误）") if placing else "接口无返回"
+        info["_note"] = f"⚠️ 上市公告书查询失败：{error_msg}"
+        info["_circulation_error"] = error_msg
+        # 不设置 circulation_scale / lock_scale，让报告自行处理缺失情况
 
 
 # 正股行情缓存，避免重复请求
@@ -2597,21 +2711,24 @@ def estimate_bond_listing_price(transfer_value, circulation_scale, rating,
     if capped:
         detail_parts.append(cap_reason)
 
-    # 生成简洁摘要
+    # 生成简洁摘要（涨幅=从面值100元的实际涨跌幅）
+    price_gain = round(estimated_price - 100, 1)
     if is_yaozhai:
         if estimated_price >= 157:
             range_text = "🔥 妖债，大概率顶格157.3元，次日有望继续涨停"
         else:
             range_text = f"🔥 妖债，预估 {estimated_price}元（溢价率{premium_pct}%）"
+    elif estimated_price >= 150:
+        range_text = f"预估 {estimated_price}元，涨幅约{price_gain}%"
     elif estimated_price >= 130:
-        range_text = f"预估 {estimated_price}元，有望冲击130+"
+        range_text = f"预估 {estimated_price}元，涨幅约{price_gain}%"
     elif estimated_price >= 120:
-        range_text = f"预估 {estimated_price}元，涨幅约{premium_pct}%"
+        range_text = f"预估 {estimated_price}元，涨幅约{price_gain}%"
     elif estimated_price >= 110:
-        range_text = f"预估 {estimated_price}元，涨幅约{premium_pct}%"
+        range_text = f"预估 {estimated_price}元，涨幅约{price_gain}%"
     else:
         suffix = "，注意破发风险" if estimated_price < 105 else ""
-        range_text = f"预估 {estimated_price}元，涨幅约{premium_pct}%{suffix}"
+        range_text = f"预估 {estimated_price}元，涨幅约{price_gain}%{suffix}"
 
     return {
         "price": estimated_price,
@@ -2627,7 +2744,10 @@ def estimate_bond_listing_price(transfer_value, circulation_scale, rating,
 def get_valuation_advice(item_type, issue_pe, industry_pe, rating=None, stock_detail=None):
     """基于估值给出打新建议（2025-2026年零破发环境适配版）"""
     if item_type == "bond":
-        # 可转债估值逻辑（不变）
+        # 可转债申购建议：零破发环境一律顶格，出现破发后按评级分档
+        bond_temp = _BOND_MARKET_TEMP
+        if bond_temp.get("break_rate", 0) == 0:
+            return "顶格申购", "当前可转债零破发，中签即赚"
         if rating and rating.startswith("AAA"):
             return "顶格申购", "优质AAA级转债，破发风险极低"
         elif rating and rating.startswith("AA"):
@@ -2919,6 +3039,48 @@ def _xgb_predict_listing(stock_detail, sector_label="", sector_boost=0):
         return None
 
 
+def _get_lot_size(stock_code):
+    """根据股票代码判断一签多少股"""
+    if not stock_code:
+        return 500  # 默认
+    code_str = str(stock_code).strip()
+    # 北交所
+    if code_str.startswith(("8", "920", "43")):
+        return 100
+    # 沪市主板
+    if code_str.startswith(("60",)):
+        return 1000
+    # 深市主板 / 创业板 / 科创板
+    return 500
+
+
+def _format_listing_summary(estimated, stock_detail, temp):
+    """生成上市结论文字，包含预计单签收益"""
+    issue_price = None
+    if stock_detail:
+        try:
+            issue_price = float(stock_detail.get("issue_price", 0))
+        except (ValueError, TypeError):
+            pass
+
+    single_lot_profit = None
+    if issue_price and issue_price > 0:
+        stock_code = stock_detail.get("stock_code") if stock_detail else None
+        lot_size = _get_lot_size(stock_code)
+        single_lot_profit = issue_price * lot_size * estimated / 100 / 10000  # 万元
+
+    if temp == "冷市":
+        return f"❄️ 预计首日涨幅 {estimated}%，冷市涨幅受限"
+    if estimated >= 500:
+        part = f"{estimated}%+"
+    else:
+        part = f"约{estimated}%"
+    if single_lot_profit and single_lot_profit >= 0.01:
+        return f"预计首日涨幅{part}，预计首日单签收益{single_lot_profit:.2f}万元"
+    else:
+        return f"预计首日涨幅{part}"
+
+
 def get_listing_analysis(item_type, issue_price, issue_pe, industry_pe, bond_detail=None, stock_detail=None):
     """上市首日表现预估（2025-2026年零破发环境适配版）"""
     if item_type == "bond":
@@ -2962,15 +3124,15 @@ def get_listing_analysis(item_type, issue_price, issue_pe, industry_pe, bond_det
         detail_parts.append(f"🌡️ 温度衰减: {temp}（×{temp_mult}）→{estimated}%")
 
         if temp == "冷市":
-            summary = f"❄️ 预计首日涨幅 {estimated}%，冷市涨幅受限（XGBoost）"
+            summary = f"❄️ 预计首日涨幅 {estimated}%，冷市涨幅受限"
         elif estimated >= 500:
-            summary = f"🔥 预计首日涨幅 {estimated}%+（XGBoost）"
+            summary = _format_listing_summary(estimated, stock_detail, temp)
         elif estimated >= 200:
-            summary = f"预计首日涨幅约{estimated}%，收益可观（XGBoost）"
+            summary = _format_listing_summary(estimated, stock_detail, temp)
         elif estimated >= 100:
-            summary = f"预计首日涨幅约{estimated}%（XGBoost）"
+            summary = f"预计首日涨幅约{estimated}%"
         else:
-            summary = f"预计首日涨幅约{estimated}%（XGBoost）"
+            summary = f"预计首日涨幅约{estimated}%"
 
         return {"summary": summary, "detail": "\n".join(detail_parts), "price": None, "predicted_return": estimated}
 
@@ -3038,9 +3200,9 @@ def get_listing_analysis(item_type, issue_price, issue_pe, industry_pe, bond_det
     if temp == "冷市":
         summary = f"❄️ 预计首日涨幅 {estimated}%，冷市环境下涨幅受限"
     elif estimated >= 500:
-        summary = f"🔥 预计首日涨幅 {estimated}%+，超级热门赛道，中一签有望赚10万+"
+        summary = _format_listing_summary(estimated, stock_detail, temp)
     elif estimated >= 200:
-        summary = f"预计首日涨幅约{estimated}%，热门赛道加持，收益可观"
+        summary = _format_listing_summary(estimated, stock_detail, temp)
     elif estimated >= 100:
         summary = f"预计首日涨幅约{estimated}%，打新收益良好"
     else:
@@ -3246,6 +3408,7 @@ def generate_markdown(date_display, weekday, apply_stocks, apply_bonds, list_sto
     for b in list_bonds:
         analysis = b.get("listing_analysis", {})
         summary = analysis.get("summary", "预计上市") if isinstance(analysis, dict) else str(analysis)
+        market = _get_market(b["code"])
         listing_items.append(f"{b['name']}-{market}（{summary}）")
     if listing_items:
         lines.append("**上市**")
@@ -3284,8 +3447,8 @@ def generate_markdown(date_display, weekday, apply_stocks, apply_bonds, list_sto
         if apply_stocks:
             lines.append("### 📈 新股申购")
             lines.append("")
-            lines.append("| 股票代码 | 股票简称 | 发行价(元) | 发行PE | 行业PE | 发行规模(亿) | 申购建议 |")
-            lines.append("|----------|----------|-----------|--------|--------|-------------|----------|")
+            lines.append("| 代码 | 简称 | 发行价 | 发行PE | 行业PE | 发行规模 | 申购建议 |")
+            lines.append("|------|------|--------|--------|--------|----------|----------|")
             for s in apply_stocks:
                 if s.get("has_detail"):
                     d = s["detail"]
@@ -3364,18 +3527,17 @@ def generate_markdown(date_display, weekday, apply_stocks, apply_bonds, list_sto
                         lines.append(f"- **发行规模**：{d['issue_scale']}亿元")
                     if d.get("lock_scale") is not None:
                         lines.append(f"- **限售规模**：约{d['lock_scale']}亿元")
-                    if d.get("circulation_scale"):
-                        range_info = f"（范围{d.get('circulation_range', '')}）" if d.get("circulation_range") else ""
+                    if d.get("circulation_scale") is not None:
                         note = d.get("_note", "")
-                        if "公告" in note:
+                        if "上市公告书" in note:
                             label = "流通规模"
                             warn = ""
-                            explain = ""
                         else:
-                            label = "预估流通规模"
-                            warn = " ⚠️"
-                            explain = f"\n  > 📐 估算说明：限售规模=发行规模×原股东配售比例×限售系数，系数基于历史案例回归，实际以大股东持股集中度为准，存在偏差"
-                        lines.append(f"- **{label}**：约{d['circulation_scale']}亿元{range_info}{warn}{explain}")
+                            label = "流通规模"
+                            warn = ""
+                        lines.append(f"- **{label}**：约{d['circulation_scale']}亿元")
+                    elif d.get("_circulation_error"):
+                        lines.append(f"- **流通规模**：❌ 获取失败 — {d['_circulation_error']}")
                     if d.get("market_cap_ratio") is not None:
                         lines.append(f"- **转债总市值占比**：{d['market_cap_ratio']}%")
                     if d.get("ytm_pre_tax") is not None:
@@ -3398,7 +3560,7 @@ def generate_markdown(date_display, weekday, apply_stocks, apply_bonds, list_sto
         if list_stocks:
             lines.append("### 📈 新股上市")
             lines.append("")
-            lines.append("| 股票代码 | 股票简称 | 发行价(元) | 发行PE | 行业PE | 首日预估 |")
+            lines.append("| 代码 | 简称 | 发行价 | 发行PE | 行业PE | 首日预估 |")
             lines.append("|----------|----------|-----------|--------|--------|----------|")
             for s in list_stocks:
                 if s.get("has_detail"):
@@ -3480,10 +3642,10 @@ def generate_markdown(date_display, weekday, apply_stocks, apply_bonds, list_sto
                             lines.append(f"- **转股溢价率**：{d['premium_ratio']}%")
                         if d.get("stock_price"):
                             lines.append(f"- **正股价**：{d['stock_price']}元")
-                        if d.get("circulation_scale"):
-                            note = d.get("_note", "")
-                            label = "流通规模" if "公告" in note else "预估流通规模"
-                            lines.append(f"- **{label}**：约{d['circulation_scale']}亿元")
+                        if d.get("circulation_scale") is not None:
+                            lines.append(f"- **流通规模**：约{d['circulation_scale']}亿元")
+                        elif d.get("_circulation_error"):
+                            lines.append(f"- **流通规模**：❌ {d['_circulation_error']}")
                         lines.append("")
 
     # ── 预测跟踪统计 ──
@@ -3493,7 +3655,7 @@ def generate_markdown(date_display, weekday, apply_stocks, apply_bonds, list_sto
     lines.append("")
     lines.append("*本报告由打新日报系统自动生成，数据来源：东方财富网、巨潮资讯网。*")
     lines.append("")
-    lines.append("*⚠️ 流通规模说明：配售结果公告发布后，流通规模以公告中「控股股东+实控人+一致行动人」配售量为限售依据精确计算；公告发布前为估算值。大股东持股计算可能存在个别误差，如发现异常欢迎指正。*")
+    lines.append("*⚠️ 流通规模说明：取自上市公司公告书「前十名可转换公司债券持有人」表格，以控股股东+实际控制人+一致行动人的配售量为限售依据，精确计算流通规模。若公告书未发布或解析失败，则不展示估算值，并注明失败原因。*")
     lines.append(f"*报告日期：{date_display} {weekday}*")
 
     return "\n".join(lines)
@@ -3520,8 +3682,8 @@ def generate_html(md_content, data):
     h3 {{ color: #2c3e50; font-size: 17px; margin-top: 20px; }}
     h4 {{ color: #34495e; font-size: 15px; margin: 16px 0 8px 0; }}
     table {{ width: 100%; border-collapse: collapse; margin: 12px 0; font-size: 14px; }}
-    th {{ background: #2c3e50; color: white; padding: 10px 12px; text-align: left; }}
-    td {{ padding: 10px 12px; border-bottom: 1px solid #eee; }}
+    th {{ background: #2c3e50; color: white; padding: 10px 12px; text-align: center; white-space: nowrap; }}
+    td {{ padding: 10px 12px; border-bottom: 1px solid #eee; text-align: center; }}
     tr:hover {{ background: #f8f9fa; }}
     .subtitle {{ color: #888; font-size: 13px; }}
     .disclaimer {{ color: #999; font-size: 12px; }}
@@ -3549,7 +3711,7 @@ def generate_html(md_content, data):
         html += '<p class="section-empty">明日无可申购的新股或新债。</p>\n'
     else:
         if data["apply_stocks"]:
-            html += '<h3>📈 新股申购</h3>\n<table>\n<tr><th>股票代码</th><th>股票简称</th><th>发行价</th><th>发行PE</th><th>行业PE</th><th>规模(亿)</th><th>建议</th></tr>\n'
+            html += '<h3>📈 新股申购</h3>\n<table>\n<tr><th>代码</th><th>简称</th><th>发行价</th><th>发行PE</th><th>行业PE</th><th>规模</th><th>建议</th></tr>\n'
             for s in data["apply_stocks"]:
                 d = s.get("detail", {}) if s.get("has_detail") else {}
                 html += f'<tr><td>{s["code"]}</td><td>{s["name"]}</td><td>{d.get("issue_price","-")}</td><td>{d.get("issue_pe","-")}</td><td>{d.get("industry_pe","-")}</td><td>{d.get("fund_raised","-")}</td><td class="advice">{s.get("advice","待评估")}</td></tr>\n'
@@ -3579,10 +3741,14 @@ def generate_html(md_content, data):
                     html += f'<div class="bond-item"><h4>{b["name"]}（{b["code"]}）</h4>'
                     html += f'<p><strong>建议：</strong>{b.get("advice","待评估")} — {b.get("reason","")}</p>'
                     if d.get("rating"):
-                        circulation_info = f'约{d.get("circulation_scale","")}亿'
-                        if d.get("circulation_range"):
-                            circulation_info += f'（范围{d["circulation_range"]}）'
-                        html += f'<p><strong>评级：</strong>{d["rating"]} | <strong>规模：</strong>{d.get("issue_scale","")}亿 | <strong>流通：</strong>{circulation_info} | <strong>限售：</strong>约{d.get("lock_scale","")}亿</p>'
+                        html += f'<p><strong>评级：</strong>{d["rating"]} | <strong>规模：</strong>{d.get("issue_scale","")}亿'
+                        if d.get("circulation_scale") is not None:
+                            html += f' | <strong>流通：</strong>约{d["circulation_scale"]}亿'
+                        elif d.get("_circulation_error"):
+                            html += f' | <strong>流通：</strong>❌ {d["_circulation_error"]}'
+                        if d.get("lock_scale") is not None:
+                            html += f' | <strong>限售：</strong>约{d["lock_scale"]}亿'
+                        html += '</p>'
                     if d.get("stock_name"):
                         html += f'<p><strong>正股：</strong>{d["stock_name"]}（{d.get("stock_code","")}）'
                         if d.get("stock_price"):
@@ -3616,10 +3782,12 @@ def generate_html(md_content, data):
         html += '<p class="section-empty">明日无新股或新债上市。</p>\n'
     else:
         if data["list_stocks"]:
-            html += '<h3>📈 新股上市</h3>\n<table>\n<tr><th>股票代码</th><th>股票简称</th><th>发行价</th><th>发行PE</th><th>行业PE</th><th>首日预估</th></tr>\n'
+            html += '<h3>📈 新股上市</h3>\n<table>\n<tr><th>代码</th><th>简称</th><th>发行价</th><th>发行PE</th><th>行业PE</th><th>首日预估</th></tr>\n'
             for s in data["list_stocks"]:
                 d = s.get("detail", {}) if s.get("has_detail") else {}
-                html += f'<tr><td>{s["code"]}</td><td>{s["name"]}</td><td>{d.get("issue_price","-")}</td><td>{d.get("issue_pe","-")}</td><td>{d.get("industry_pe","-")}</td><td>{s.get("listing_analysis","数据不足")}</td></tr>\n'
+                la = s.get("listing_analysis", {})
+                summary = la.get("summary", "数据不足") if isinstance(la, dict) else (la or "数据不足")
+                html += f'<tr><td>{s["code"]}</td><td>{s["name"]}</td><td>{d.get("issue_price","-")}</td><td>{d.get("issue_pe","-")}</td><td>{d.get("industry_pe","-")}</td><td>{summary}</td></tr>\n'
             html += '</table>\n'
 
         if data["list_bonds"]:
@@ -3660,22 +3828,15 @@ def generate_html(md_content, data):
                         if d.get("premium_ratio") is not None:
                             html += f' | 溢价率：{d["premium_ratio"]}%'
                         html += '</p>'
-                    if d.get("circulation_scale"):
-                        note = d.get("_note", "")
-                        if "公告" in note:
-                            label = "流通规模"
-                            warn = ""
-                            explain = ""
-                        else:
-                            label = "预估流通规模"
-                            warn = ' <span style="color:#999;font-size:12px">（估算值，以配售结果公告为准）</span>'
-                            explain = '<br><span style="color:#999;font-size:11px">📐 估算说明：限售规模=发行规模×原股东配售比例×限售系数，系数基于历史案例回归，实际以大股东持股集中度为准，存在偏差</span>'
-                        html += f'<p><strong>{label}：</strong>约{d["circulation_scale"]}亿元{warn}{explain}</p>'
+                    if d.get("circulation_scale") is not None:
+                        html += f'<p><strong>流通规模：</strong>约{d["circulation_scale"]}亿元</p>'
+                    elif d.get("_circulation_error"):
+                        html += f'<p><strong>流通规模：</strong>❌ {d["_circulation_error"]}</p>'
                     html += '</div>\n'
 
     html += '</div>\n'
 
-    html += f'<div class="card">\n<p class="disclaimer">本报告由打新日报系统自动生成，数据来源：东方财富网、巨潮资讯网。<br>⚠️ 流通规模说明：配售结果公告发布后，流通规模以公告中「控股股东+实控人+一致行动人」配售量为限售依据精确计算；公告发布前为估算值。大股东持股计算可能存在个别误差，如发现异常欢迎指正。<br>报告日期：{data["date_display"]} {data["weekday"]}</p>\n</div>\n'
+    html += f'<div class="card">\n<p class="disclaimer">本报告由打新日报系统自动生成，数据来源：东方财富网、巨潮资讯网。<br>⚠️ 流通规模说明：取自上市公司公告书「前十名可转换公司债券持有人」表格，以控股股东+实际控制人+一致行动人的配售量为限售依据，精确计算流通规模。若公告书未发布或解析失败，则不展示估算值，并注明失败原因。<br>报告日期：{data["date_display"]} {data["weekday"]}</p>\n</div>\n'
     html += '</body>\n</html>'
 
     return html
