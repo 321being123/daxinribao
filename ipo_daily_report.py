@@ -2711,24 +2711,24 @@ def estimate_bond_listing_price(transfer_value, circulation_scale, rating,
     if capped:
         detail_parts.append(cap_reason)
 
-    # 生成简洁摘要（涨幅=从面值100元的实际涨跌幅）
-    price_gain = round(estimated_price - 100, 1)
+    # 生成简洁摘要（取整到5元档，如128→130, 127→125, 151.77→150）
+    rounded_price = round(estimated_price / 5) * 5
     if is_yaozhai:
         if estimated_price >= 157:
             range_text = "🔥 妖债，大概率顶格157.3元，次日有望继续涨停"
         else:
-            range_text = f"🔥 妖债，预估 {estimated_price}元（溢价率{premium_pct}%）"
+            range_text = f"🔥 妖债，预估{rounded_price}元左右"
     elif estimated_price >= 150:
-        range_text = f"预估 {estimated_price}元，涨幅约{price_gain}%"
+        range_text = f"预估{rounded_price}元左右"
     elif estimated_price >= 130:
-        range_text = f"预估 {estimated_price}元，涨幅约{price_gain}%"
+        range_text = f"预估{rounded_price}元左右"
     elif estimated_price >= 120:
-        range_text = f"预估 {estimated_price}元，涨幅约{price_gain}%"
+        range_text = f"预估{rounded_price}元左右"
     elif estimated_price >= 110:
-        range_text = f"预估 {estimated_price}元，涨幅约{price_gain}%"
+        range_text = f"预估{rounded_price}元左右"
     else:
         suffix = "，注意破发风险" if estimated_price < 105 else ""
-        range_text = f"预估 {estimated_price}元，涨幅约{price_gain}%{suffix}"
+        range_text = f"预估{rounded_price}元左右{suffix}"
 
     return {
         "price": estimated_price,
